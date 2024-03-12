@@ -10,7 +10,7 @@ using Dapper;
 
 namespace LanguageManagerPlugin;
 
-class LanguageManagerPlugin : BasePlugin
+public class LanguageManagerPlugin : BasePlugin
 {
     public override string ModuleAuthor => "aproxje";
     public override string ModuleName => "Language Manager Plugin";
@@ -65,7 +65,7 @@ class LanguageManagerPlugin : BasePlugin
 
             var isoFromGeoLocation = GetPlayerISOCode(playerIP);
 
-            if (isoFromGeoLocation == null) return;
+            if (isoFromGeoLocation == null) return;     
             SetPlayerLanguage(isoFromGeoLocation, player.SteamID, true);
         }); 
 
@@ -76,7 +76,7 @@ class LanguageManagerPlugin : BasePlugin
         CultureInfo tempCulture = new CultureInfo(playerISOCode);
         SteamID playerSteamId = new SteamID(steamID);
         this.playerLanguageManager.SetLanguage(playerSteamId, tempCulture);
-        if (updateDatabase ) { this.SavePlayerISOInDatabase(steamID, tempCulture.Name); }
+        if (updateDatabase) { this.SavePlayerISOInDatabase(steamID, tempCulture.Name); }
     }
 
     public async Task<string?> GetPlayerISOFromDatabase(ulong steamID)
