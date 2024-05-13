@@ -7,6 +7,8 @@ using MaxMind.GeoIP2;
 using System.Globalization;
 using Microsoft.Data.Sqlite;
 using Dapper;
+using System.Text.Json;
+using System.IO;
 
 namespace LanguageManagerPlugin;
 
@@ -14,14 +16,15 @@ public class LanguageManagerPlugin : BasePlugin
 {
     public override string ModuleAuthor => "aproxje";
     public override string ModuleName => "Language Manager Plugin";
-
-    public override string ModuleVersion => "0.0.2";
+    public override string ModuleVersion => "0.0.3";
     private SqliteConnection? _sqlConnection { get; set; }
 
     private PlayerLanguageManager playerLanguageManager = new PlayerLanguageManager();
+    private PluginConfig? _config;
 
     public override void Load(bool hotReload)
     {
+        this.SetupConfig();
         this.SetupPlayerDatabase();
         this.SetupCommand();
 
@@ -40,6 +43,25 @@ public class LanguageManagerPlugin : BasePlugin
         else
         {
             return playerIp;
+        }
+    }
+
+    private void SetupConfig()
+    {
+        string configPath = Path.Combine(ModuleDirectory, "config.json");
+
+        if (!File.Exists(configPath))
+        {
+            Console.WriteLine("Config file not found for language manager");
+            return;
+        }
+
+        string jsonString = File.ReadAllText(configPath);
+        _config = JsonSerializer.Deserialize<PluginConfig>(jsonString);
+
+        if (_config == null)
+        {
+            Console.WriteLine("Failed to deserialize configuration file for language manager");
         }
     }
 
@@ -133,7 +155,10 @@ public class LanguageManagerPlugin : BasePlugin
     public void SetupPlayerDatabase()
     {
         const string dbName = "playerLanguages.db";
-        string pathToDb = Path.Join(ModuleDirectory, dbName);
+        string pathToDb = string.IsNullOrEmpty(_config?.GeoDatabasePath)
+            ? Path.Join(ModuleDirectory, dbName)
+            : _config.GeoDatabasePath;
+
         string connectionString = $"Data Source={pathToDb};";
 
         if (File.Exists(pathToDb))
@@ -180,5 +205,8 @@ public class LanguageManagerPlugin : BasePlugin
 
         });
     }
-
+    private class PluginConfig
+    {
+        public string? GeoDatabasePath { get; set; }
+    }
 }
