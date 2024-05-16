@@ -9,6 +9,7 @@ using Microsoft.Data.Sqlite;
 using Dapper;
 using System.Text.Json;
 using System.IO;
+using System.Xml.Linq;
 
 namespace LanguageManagerPlugin;
 
@@ -24,6 +25,7 @@ public class LanguageManagerPlugin : BasePlugin
 
     public override void Load(bool hotReload)
     {
+        Console.WriteLine("XDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD");
         this.SetupConfig();
         this.SetupPlayerDatabase();
         this.SetupCommand();
@@ -51,7 +53,7 @@ public class LanguageManagerPlugin : BasePlugin
         string configPath = Path.Combine(ModuleDirectory, "config.json");
 
         if (!File.Exists(configPath))
-        {
+        {   
             Console.WriteLine("Config file not found for language manager");
             return;
         }
@@ -62,6 +64,9 @@ public class LanguageManagerPlugin : BasePlugin
         if (_config == null)
         {
             Console.WriteLine("Failed to deserialize configuration file for language manager");
+        } else
+        {
+            Console.WriteLine("Language manager config loaded");
         }
     }
 
@@ -120,6 +125,11 @@ public class LanguageManagerPlugin : BasePlugin
 
     public string? GetPlayerISOCode(string ipAddress)
     {
+        const string dbName = "GeoLite2-Country.mmdb";
+        string pathToDb = string.IsNullOrEmpty(_config?.GeoDatabasePath)
+            ? Path.Combine(ModuleDirectory, dbName)
+            : _config.GeoDatabasePath;
+
         using var reader = new DatabaseReader(Path.Combine(ModuleDirectory, "GeoLite2-Country.mmdb"));
         try
         {
@@ -155,10 +165,7 @@ public class LanguageManagerPlugin : BasePlugin
     public void SetupPlayerDatabase()
     {
         const string dbName = "playerLanguages.db";
-        string pathToDb = string.IsNullOrEmpty(_config?.GeoDatabasePath)
-            ? Path.Join(ModuleDirectory, dbName)
-            : _config.GeoDatabasePath;
-
+        string pathToDb = Path.Join(ModuleDirectory, dbName);
         string connectionString = $"Data Source={pathToDb};";
 
         if (File.Exists(pathToDb))
