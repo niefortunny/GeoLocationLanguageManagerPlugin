@@ -1,184 +1,233 @@
-﻿
+﻿using System.Globalization;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Translations;
+using CounterStrikeSharp.API.Modules.Commands;
 using CounterStrikeSharp.API.Modules.Entities;
-using MaxMind.GeoIP2;
-using System.Globalization;
-using Microsoft.Data.Sqlite;
 using Dapper;
+using MaxMind.GeoIP2;
+using MySqlConnector;
 
 namespace LanguageManagerPlugin;
 
-public class LanguageManagerPlugin : BasePlugin
+public class LanguageManagerConfig : BasePluginConfig
+{
+    public string DatabaseHost { get; set; } = "127.0.0.1";
+    public int DatabasePort { get; set; } = 3306;
+    public string DatabaseUser { get; set; } = "root";
+    public string DatabasePassword { get; set; } = "";
+    public string DatabaseName { get; set; } = "language_manager";
+}
+
+public class LanguageManagerPlugin : BasePlugin, IPluginConfig<LanguageManagerConfig>
 {
     public override string ModuleAuthor => "aproxje";
     public override string ModuleName => "Language Manager Plugin";
-
     public override string ModuleVersion => "0.0.2";
-    private SqliteConnection? _sqlConnection { get; set; }
 
-    private PlayerLanguageManager playerLanguageManager = new PlayerLanguageManager();
+    public LanguageManagerConfig Config { get; set; } = new();
+
+    private readonly PlayerLanguageManager _playerLanguageManager = new();
+
+    private string? _connectionString;
+    private Task _databaseSetup = Task.CompletedTask;
+    private bool _databaseReady;
+    private DatabaseReader? _geoReader;
+
+    private static readonly Dictionary<string, CultureInfo> CulturesByRegion = BuildRegionCultures();
+
+    public void OnConfigParsed(LanguageManagerConfig config)
+    {
+        Config = config;
+    }
 
     public override void Load(bool hotReload)
     {
-        this.SetupPlayerDatabase();
-        this.SetupCommand();
-
-        RegisterListener<Listeners.OnClientConnected>(OnClientPutInServerHandler);
+        _connectionString =
+            $"Server={Config.DatabaseHost};Port={Config.DatabasePort};User ID={Config.DatabaseUser};Password={Config.DatabasePassword};Database={Config.DatabaseName};";
+        _databaseSetup = SetupPlayerDatabaseAsync();
+        SetupGeoReader();
+        AddCommand("css_lang", "Language manager hook", OnLangCommand);
+        RegisterListener<Listeners.OnClientAuthorized>(OnClientAuthorized);
     }
 
-    public static string? GetPlayerIp(CCSPlayerController player)
+    public override void Unload(bool hotReload)
     {
-        var playerIp = player.IpAddress;
-        if (playerIp == null) { return null; }
-        string[] parts = playerIp.Split(':');
-        if (parts.Length == 2)
-        {
-            return parts[0];
-        }
-        else
-        {
-            return playerIp;
-        }
+        _geoReader?.Dispose();
     }
 
-    public void OnClientPutInServerHandler(int slot)
+    private void OnClientAuthorized(int slot, SteamID steamId)
     {
-
         var player = Utilities.GetPlayerFromSlot(slot);
         if (player == null || !player.IsValid || player.IsBot) return;
 
-        var playerIP = GetPlayerIp(player);
+        var playerIp = GetPlayerIp(player);
+        var steamId64 = steamId.SteamId64;
 
-        if (playerIP == null) return;
-
-        ulong playerSteamID = player.SteamID;
-
-        Task.Run(async () => {
-            string? playerISOCode = await GetPlayerISOFromDatabase(playerSteamID);
-            if ( playerISOCode != null )
-            {
-                SetPlayerLanguage(playerISOCode, playerSteamID);
-                return;
-            }
-
-            var isoFromGeoLocation = GetPlayerISOCode(playerIP);
-
-            if (isoFromGeoLocation == null) return;     
-            SetPlayerLanguage(isoFromGeoLocation, player.SteamID, true);
-        }); 
-
+        _ = ApplyLanguageAsync(playerIp, steamId64);
     }
 
-    public void SetPlayerLanguage(string playerISOCode, ulong steamID, bool updateDatabase = false)
+    private async Task ApplyLanguageAsync(string? playerIp, ulong steamId64)
     {
-        CultureInfo tempCulture = new CultureInfo(playerISOCode);
-        SteamID playerSteamId = new SteamID(steamID);
-        this.playerLanguageManager.SetLanguage(playerSteamId, tempCulture);
-        if (updateDatabase) { this.SavePlayerISOInDatabase(steamID, tempCulture.Name); }
-    }
-
-    public async Task<string?> GetPlayerISOFromDatabase(ulong steamID)
-    {
-        string query = $"SELECT steamID, playerISOCode FROM playerLanguages WHERE steamID = {steamID}";
-        var command = new SqliteCommand(query, _sqlConnection);
-        using (var reader = await command.ExecuteReaderAsync())
-        {
-            while (await reader.ReadAsync())
-            {
-                string playerISOCode = reader.GetFieldValue<string>(1); // assuming playerISOCode is in the second column
-                if (playerISOCode != null) {
-                    return playerISOCode;
-                }
-            }
-        }
-        return null;
-    }
-
-    public string? GetPlayerISOCode(string ipAddress)
-    {
-        using var reader = new DatabaseReader(Path.Combine(ModuleDirectory, "GeoLite2-Country.mmdb"));
         try
         {
-            var response = reader.Country(ipAddress);
-            return response.Country.IsoCode;
+            var stored = await GetStoredCultureAsync(steamId64);
+            var fromGeo = stored == null;
+            var cultureName = stored ?? CountryCultureName(playerIp);
+            if (cultureName == null || !TryResolveCulture(cultureName, out var culture)) return;
+
+            Server.NextFrame(() => _playerLanguageManager.SetLanguage(new SteamID(steamId64), culture));
+
+            if (fromGeo)
+                await SaveCultureAsync(steamId64, culture.Name);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine(e.Message);
+        }
+    }
+
+    private void OnLangCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player == null || info.ArgCount < 2) return;
+
+        var isoCode = info.GetArg(1);
+        if (isoCode.Length != 2 || !TryResolveCulture(isoCode, out var culture)) return;
+
+        var steamId64 = player.SteamID;
+        _playerLanguageManager.SetLanguage(new SteamID(steamId64), culture);
+        _ = SaveCultureAsync(steamId64, culture.Name);
+    }
+
+    private async Task SetupPlayerDatabaseAsync()
+    {
+        try
+        {
+            await using var connection = await OpenConnectionAsync();
+            await connection.ExecuteAsync("""
+                CREATE TABLE IF NOT EXISTS CSSPlayerLanguages (
+                    steamID BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+                    playerISOCode VARCHAR(32) NOT NULL)
+                """);
+            _databaseReady = true;
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"MySQL setup failed: {e.Message}");
+        }
+    }
+
+    private async Task<MySqlConnection> OpenConnectionAsync()
+    {
+        var connection = new MySqlConnection(_connectionString);
+        await connection.OpenAsync();
+        return connection;
+    }
+
+    private void SetupGeoReader()
+    {
+        var path = Path.Combine(ModuleDirectory, "GeoLite2-Country.mmdb");
+        if (!File.Exists(path))
+        {
+            Console.WriteLine($"GeoLite2-Country.mmdb not found at {path}");
+            return;
+        }
+
+        _geoReader = new DatabaseReader(path);
+    }
+
+    private async Task<string?> GetStoredCultureAsync(ulong steamId)
+    {
+        await _databaseSetup;
+        if (!_databaseReady) return null;
+
+        await using var connection = await OpenConnectionAsync();
+        return await connection.QueryFirstOrDefaultAsync<string>(
+            "SELECT playerISOCode FROM CSSPlayerLanguages WHERE steamID = @SteamID",
+            new { SteamID = steamId });
+    }
+
+    private async Task SaveCultureAsync(ulong steamId, string cultureName)
+    {
+        try
+        {
+            await _databaseSetup;
+            if (!_databaseReady) return;
+
+            await using var connection = await OpenConnectionAsync();
+            await connection.ExecuteAsync("""
+                INSERT INTO CSSPlayerLanguages (steamID, playerISOCode) VALUES (@SteamID, @PlayerISO)
+                ON DUPLICATE KEY UPDATE playerISOCode = @PlayerISO
+                """, new { SteamID = steamId, PlayerISO = cultureName });
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine(e.Message);
+        }
+    }
+
+    private string? CountryCultureName(string? ipAddress)
+    {
+        if (ipAddress == null || _geoReader == null) return null;
+
+        try
+        {
+            var country = _geoReader.Country(ipAddress).Country.IsoCode;
+            return country != null && CulturesByRegion.TryGetValue(country, out var culture)
+                ? culture.Name
+                : null;
         }
         catch (Exception ex)
         {
             Console.WriteLine(ex.Message);
             return null;
         }
-
     }
 
-    public void SavePlayerISOInDatabase(ulong steamID, string playerISO)
+    private static string? GetPlayerIp(CCSPlayerController player)
     {
-        if (_sqlConnection == null) { return; }
-        Task.Run(async () =>
+        var playerIp = player.IpAddress;
+        if (string.IsNullOrEmpty(playerIp)) return null;
+
+        if (playerIp[0] == '[')
         {
-            try
-            {
-                await _sqlConnection.ExecuteAsync($@"
-                INSERT INTO `playerLanguages` (`steamID`, `playerISOCode`) VALUES (@SteamID, @PlayerISO)
-                ON CONFLICT(`steamID`) DO UPDATE SET `playerISOCode` = @PlayerISO
-            ", new { SteamID = steamID, PlayerISO = playerISO });
-            } catch (Exception e)
-            {
-                Console.WriteLine(e.Message);
-            }
-        });
+            var end = playerIp.IndexOf(']');
+            if (end > 1) return playerIp[1..end];
+        }
+
+        var colon = playerIp.LastIndexOf(':');
+        return colon > 0 ? playerIp[..colon] : playerIp;
     }
 
-    public void SetupPlayerDatabase()
+    private static bool TryResolveCulture(string code, out CultureInfo culture)
     {
-        const string dbName = "playerLanguages.db";
-        string pathToDb = Path.Join(ModuleDirectory, dbName);
-        string connectionString = $"Data Source={pathToDb};";
-
-        if (File.Exists(pathToDb))
+        try
         {
-            // Database exists
-            _sqlConnection = new SqliteConnection(connectionString);
-            _sqlConnection.Open();
-        } else{
-            // Create a database
-            using (var fileStream = File.Create(pathToDb))
-            {
-                fileStream.Close();
-            }
-
-            _sqlConnection = new SqliteConnection(connectionString);
-            _sqlConnection.Open();
-
-            Task.Run(async () =>
-            {
-                await _sqlConnection.ExecuteAsync(@"CREATE TABLE IF NOT EXISTS `playerLanguages` (
-                    steamID INTEGER UNSIGNED NOT NULL PRIMARY KEY,
-                    playerISOCode TEXT NOT NULL)");
-            });
+            culture = CultureInfo.GetCultureInfo(code);
+            return true;
+        }
+        catch (CultureNotFoundException)
+        {
+            if (CulturesByRegion.TryGetValue(code, out culture!)) return true;
+            culture = CultureInfo.InvariantCulture;
+            return false;
         }
     }
 
-    public void SetupCommand()
+    private static Dictionary<string, CultureInfo> BuildRegionCultures()
     {
+        var map = new Dictionary<string, CultureInfo>(StringComparer.OrdinalIgnoreCase);
+        foreach (var culture in CultureInfo.GetCultures(CultureTypes.SpecificCultures))
+        {
+            try
+            {
+                map.TryAdd(new RegionInfo(culture.Name).TwoLetterISORegionName, culture);
+            }
+            catch (ArgumentException)
+            {
+            }
+        }
 
-        // Adds another hook kindof to catch what language user is changing
-        // Only works with iso rn
-        this.AddCommand("css_lang", "Language manager hook",
-            (player, info) => {
-                if (player == null) { return; }
-                if (info.ArgCount < 2) { return; }
-                string isoCode = info.GetArg(1);
-                // Idk check for ISO by length :^))
-                if (isoCode.Length != 2) { return; }
-                ulong playerSteamID = player.SteamID;
-                Task.Run(() =>
-                {
-                    SetPlayerLanguage(isoCode, playerSteamID, true);
-                });
-
-        });
+        return map;
     }
-
 }
